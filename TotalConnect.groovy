@@ -15,6 +15,7 @@
  */
  /*
  Version: v0.3.3
+ Changes [July 23rd, 2017]
  - SmartThings/TotalConnect (not sure who?) broke Synchronous API calls, so implemented Asynchronous calls. Major Asynchronous code references are from Oendaril - https://github.com/Oendaril/TotalConnectAsync/blob/master/TCAsync.groovy
  - Hardcoded backend values so users dont have to implement them during setup, but have flexiblity to change if needed. Code: jhstroebel@github
 
