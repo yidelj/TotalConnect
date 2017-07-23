@@ -1,7 +1,7 @@
 /**
  *  TotalConnect
  *
- *  Copyright 2014 Yogesh Mhatre
+ *  Copyright 2017 Yogesh Mhatre, Oendaril, jhstroebel@github
  *
  *  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  *  in compliance with the License. You may obtain a copy of the License at:
@@ -14,24 +14,30 @@
  *
  */
  /*
- Version: v0.3.2 
+ Version: v0.3.3
+ - SmartThings/TotalConnect (not sure who?) broke Synchronous API calls, so implemented Asynchronous calls. Major Asynchronous code references are from Oendaril - https://github.com/Oendaril/TotalConnectAsync/blob/master/TCAsync.groovy
+ - Hardcoded backend values so users dont have to implement them during setup, but have flexiblity to change if needed. Code: jhstroebel@github
+
+ Version: v0.3.2
  Changes [June 10th, 2017]
  	- Location listing correction.
-    
+
  Version: v0.3.1
  Changes [November 12th, 2015]
  	- Added ability to select Total Connect Location for users with multiple Locations. For sigle location users, it will default to your location
  	- Implemented logic to successfully message. Though there is room for improvement
- 	
+
  Version: v0.3.
  Changes [August 30th, 2015]
  	- Logic to check if the Arm/DisArm signal actually implemented or not.
     - User dont have to input LocationID & DeviceID. Its been capatured from the response now.
- 
+
  */
- 
+
+include 'asynchttp_v1'
+
 definition(
-    name: "TotalConnect v0.3.2",
+    name: "TotalConnect v0.3.3",
     namespace: "Security",
     author: "Yogesh Mhatre",
     description: "Total Connect App to lock/unlock your home based on your location and mode",
@@ -40,77 +46,75 @@ definition(
     iconX2Url: "https://s3.amazonaws.com/yogi/TotalConnect/300.png")
 
 preferences {
-    page(name: "credentials", title: "Total Connect Login", nextPage: "locationList", uninstall: true) {
-        section ("Give your Total Connect credentials. It is recommended to make another total connect user for SmartThings. This user should have a passcode set") {
-    		input("userName", "text", title: "Username", description: "Your username for TotalConnect")
-    		input("password", "password", title: "Password", description: "Your Password for TotalConnect")
-    		input("applicationId", "text", title: "Application ID - It is '14588' currently", description: "Application ID")
-    		input("applicationVersion", "text", title: "Application Version", description: "Application Version")
-			}
-    	}
-    page(name: "locationList", title: "Select the Total Connect Location for this App", uninstall: true, install: true)
+	page(name: "authenticate", content: "authenticate")
+  page(name: "selectLocation", content: "selectLocation")
+  page(name: "confirmation", content: "confirmation")
 }
 
-// Start of Page Functions
-private locationList(params=[:]){
-	def locations = locationFound()
-    def optionList = locations.keySet() as List
-    log.debug optionList
-	return dynamicPage(name:"locationList", title:"Pulling up the Location List!", uninstall: true) {
-		section("Select from the following Locations for Total Connect.") {
-			input(name: "selectedLocation", type: "enum", required: true, title: "Select the Location", options:optionList, multiple: false)
-		}
-	}
+// First Page for authentication
+def authenticate() {
+	dynamicPage(name: "authenticate", title: "Total Connect Login", nextPage: "selectLocation",uninstall: true, install: false){
+    section("Give your TotalConnect credentials") {
+      paragraph "It is recommended to make another total connect user for SmartThings. This user should have a passcode SET"
+      input("userName", "text", title: "Username", description: "Your username for TotalConnect")
+      input("password", "password", title: "Password", description: "Your Password for TotalConnect", submitOnChange:true)
+    }
+    section("Backend TotalConnect Values - DO NOT CHANGE", hideable: true, hidden: true) {
+      paragraph "These are required for login. They typically do not change"
+      input("applicationId", "text", title: "Application ID currently - 14588", description: "Application ID", defaultValue: "14588")
+      input("applicationVersion", "text", title: "Application Version currently - 3.24.1", description: "Application Version", defaultValue: "3.24.1")
+    }
+  }
+
 }
-Map locationFound() {
-    log.debug "Executed location function during Setup"
-    def token
-	def paramsLogin = [
-    	uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/AuthenticateUserLogin",
-    	body: [userName: settings.userName , password: settings.password, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion]
-    	]
-			httpPost(paramsLogin) { responseLogin ->
-    		token = responseLogin.data.SessionID 
-       }
-    log.debug "Smart Things has logged In to get Locations. SessionID: ${token}"   
-    def locationId
-    def locationName
-    def locationMap = [:]
-    def getSessionParams = [
-    	uri: "https://rs.alarmnet.com/tc21api/tc2.asmx/GetSessionDetails",
-        body: [ SessionID: token, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion]
-    					]
-   		httpPost(getSessionParams) { responseSession -> 
-        						 responseSession.data.Locations.LocationInfoBasic.each
-        						 {
-        						 	LocationInfoBasic ->
-        						 	locationName = LocationInfoBasic.LocationName
-                                    locationId = LocationInfoBasic.LocationID
-        						 	locationMap["${locationName}"] = "${locationId}"
-        						 }    							
-    				}
-	log.debug "This is map during Settings " + locationMap
-    
-    def paramsLogout = [
-    			uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/Logout",
-    			body: [SessionID: token]
-    			]
-   				httpPost(paramsLogout) { responseLogout ->
-        		log.debug "Smart Things has successfully logged out during settings"
-        	}
-    return locationMap
+
+// Second Page that pulls Location Map to select a Location for multiLocation users of TotalConnect
+def selectLocation() {
+  atomicState.applicationId = settings.applicationId
+  atomicState.applicationVersion = settings.applicationVersion
+  //log.debug "During authentication page applicationId is $atomicState.applicationId & applicationVersion is $atomicState.applicationVersion"
+  getLocations()
+  while (atomicState.locationMap == null)
+    {
+      pause(1000)
+    } // This while loop is "bit disturbing, but needed. Until atomicState.locationMap does not have any value, we are making the app pause for a seconds. Typically in my observance, the while loop is only executed thrice or less"
+  //log.debug "During selectLocation Page, LocationMap is $atomicState.locationMap"
+  def locations = atomicState.locationMap
+  def optionList = locations.keySet() as List
+  //log.debug "OptionList are " + optionList
+  dynamicPage(name: "selectLocation", title: "Select the Location of your Total Connect Alarm",nextPage: "confirmation", uninstall: true, install: false) {
+    section("Select from the following Locations for Total Connect.") {
+      input(name: "selectLocation", type: "enum", required: true, title: "Select the Location", options:optionList, multiple: false, submitOnChange:true)
+    }
+  }
 }
-// End of Page Functions
+
+// Third page to store LocationID & DeviceID for SmartApp use
+def confirmation(){
+  //log.debug "Option selected is $settings.selectLocation"
+  def selectedLocation = settings.selectLocation
+  log.debug "During Confirmation Page, LocationMap: $atomicState.locationMap, DeviceMap: $atomicState.deviceMap"
+  def locations = atomicState.locationMap
+  def devices = atomicState.deviceMap
+  def deviceId = devices["${selectedLocation}"]
+  def locationId = locations["${selectedLocation}"]
+  log.debug "DeviceId is $deviceId & LocationId is $locationId"
+  dynamicPage(name: "confirmation", title: "Selected LocationID & DeviceID", uninstall: true, install: true) {
+    section("DO NOT CHANGE - These values are fetched from your selected Location.") {
+      input(name: "locationId", type: "text", required: true, title: "LocationID", defaultValue: locationId)
+      input(name: "deviceId", type: "text", required: true, title: "DeviceID", defaultValue: deviceId)
+    }
+  }
+}
 
 // SmartThings defaults
 def installed() {
-	//log.debug "Installed with settings: ${settings}"
+	  log.debug "Installed with settings: Username: $settings.userName, AplicationId: $settings.applicationId & ApplicationVersion: $settings.applicationVersion, DeviceId: $settings.deviceId & LocationId: $settings.locationId"
     subscribe(location, checkMode)
-
 }
 
 def updated() {
-	//log.debug "Updated with settings: ${settings}"
+  log.debug "Updated with settings: Username: $settings.userName, AplicationId: $settings.applicationId & ApplicationVersion: $settings.applicationVersion, DeviceId: $settings.deviceId & LocationId: $settings.locationId"
 	unsubscribe()
     subscribe(location, checkMode)
 }
@@ -119,7 +123,7 @@ def updated() {
 def checkMode(evt) {
     	if (evt.value == "Away") {
             	log.debug "Mode is set to Away, Performing ArmAway"
-            	armAway()   
+            	armAway()
             }
         else if (evt.value == "Night") {
             	log.debug "Mode is set to Night, Performing ArmStay"
@@ -131,152 +135,336 @@ def checkMode(evt) {
         }
 }
 
-// Login Function. Returns SessionID for rest of the functions
-def login(token) {
-	log.debug "Executed login"
-	def paramsLogin = [
-    	uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/AuthenticateUserLogin",
-    	body: [userName: settings.userName , password: settings.password, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion]
-    	]
-		httpPost(paramsLogin) { responseLogin ->
-    	token = responseLogin.data.SessionID 
-       }
-       log.debug "Smart Things has logged In. SessionID: ${token}" 
-    return token
-} // Returns token      
-
-// Logout Function. Called after every mutational command. Ensures the current user is always logged Out.
-def logout(token) {
-		log.debug "During logout - ${token}"
-   		def paramsLogout = [
-    			uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/Logout",
-    			body: [SessionID: token]
-    			]
-   				httpPost(paramsLogout) { responseLogout ->
-        		log.debug "Smart Things has successfully logged out"
-        	}  
-}
-
-// Gets Panel Metadata. Takes token & location ID as an argument
-Map panelMetaData(token, locationId) {
-	def alarmCode
-    def lastSequenceNumber
-    def lastUpdatedTimestampTicks
-    def partitionId
- 	def getPanelMetaDataAndFullStatus = [
-    									uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/GetPanelMetaDataAndFullStatus",
-        								body: [ SessionID: token, LocationID: locationId, LastSequenceNumber: 0, LastUpdatedTimestampTicks: 0, PartitionID: 1]
-    ]
-   	httpPost(getPanelMetaDataAndFullStatus) {	response -> 
-        										lastUpdatedTimestampTicks = response.data.PanelMetadataAndStatus.'@LastUpdatedTimestampTicks'
-        										lastSequenceNumber = response.data.PanelMetadataAndStatus.'@ConfigurationSequenceNumber'
-        										partitionId = response.data.PanelMetadataAndStatus.Partitions.PartitionInfo.PartitionID
-        										alarmCode = response.data.PanelMetadataAndStatus.Partitions.PartitionInfo.ArmingState
-                                                
-    }
-	//log.debug "AlarmCode is " + alarmCode
-  return [alarmCode: alarmCode, lastSequenceNumber: lastSequenceNumber, lastUpdatedTimestampTicks: lastUpdatedTimestampTicks]
-} //Should return alarmCode, lastSequenceNumber & lastUpdateTimestampTicks
-
-// Get LocationID & DeviceID map
-Map getSessionDetails(token) {
-	def locationId
-    def deviceId
-    def locationName
-    Map locationMap = [:]
-    Map deviceMap = [:]
-	def getSessionParams = [
-    					uri: "https://rs.alarmnet.com/tc21api/tc2.asmx/GetSessionDetails",
-        				body: [ SessionID: token, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion]
-    					]
-   	httpPost(getSessionParams) { responseSession -> 
-        						 responseSession.data.Locations.LocationInfoBasic.each
-        						 {
-        						 	LocationInfoBasic ->
-        						 	locationName = LocationInfoBasic.LocationName
-        						 	locationId = LocationInfoBasic.LocationID
-        						 	deviceId = LocationInfoBasic.DeviceList.DeviceInfoBasic.DeviceID
-        						 	locationMap["${locationName}"] = "${locationId}"
-                                    deviceMap["${locationName}"] = "${deviceId}"
-        						 }    							
-    				}
-	// log.debug "Location map is " + locationMap + "& Devie ID map is " + deviceMap
-  	return [locationMap: locationMap, deviceMap: deviceMap]
-} // Should return Map of Locations
-
-// Arm Function. Performs arming function
-def armAway() {        
-        	def token = login(token)
-    	def details = getSessionDetails(token) // Gets Map of Location
-            // log.debug "This was Selected " + settings.selectedLocation
-    	def locationName = settings.selectedLocation
-    	def locationId = details.locationMap[locationName]
-            // log.debug "ArmAway Function. Location ID is " + locationId
-    	def deviceId = details.deviceMap[locationName]
-            // log.debug "ArmAway Function. Device ID is " + deviceId
-            
-    	def paramsArm = [
-    			uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/ArmSecuritySystem",
-    			body: [SessionID: token, LocationID: locationId, DeviceID: deviceId, ArmType: 0, UserCode: '-1']
-    			]
-   			httpPost(paramsArm) // Arming Function in away mode
-        def metaData = panelMetaData(token, locationId) // Get AlarmCode
-            while( metaData.alarmCode != 10201 ){ 
-                pause(3000) // 3 Seconds Pause to relieve number of retried on while loop
-                metaData = panelMetaData(token, locationId)
-            }  
-            //log.debug "Home is now Armed successfully" 
-            sendPush("Home is now Armed successfully")     
-   logout(token)
-}
-
-def armStay() {        
-	def token = login(token)
-    	def details = getSessionDetails(token) // Gets Map of Location
-            // log.debug "This was Selected " + settings.selectedLocation
-    	def locationName = settings.selectedLocation
-    	def locationId = details.locationMap[locationName]
-            // log.debug "ArmStay Function. Location ID is " + locationId
-    	def deviceId = details.deviceMap[locationName]
-            // log.debug "ArmStay Function. Device ID is " + deviceId
-            
-    	def paramsArm = [
-    			uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/ArmSecuritySystem",
-    			body: [SessionID: token, LocationID: locationId, DeviceID: deviceId, ArmType: 1, UserCode: '-1']
-    			]
-   			httpPost(paramsArm) // Arming function in stay mode
-    	def metaData = panelMetaData(token, locationId) // Gets AlarmCode
-            while( metaData.alarmCode != 10203 ){ 
-                pause(3000) // 3 Seconds Pause to relieve number of retried on while loop
-                metaData = panelMetaData(token, locationId)
-            } 
-            //log.debug "Home is now Armed for Night successfully"     
- 			sendPush("Home is armed in Night mode successfully")
-    logout(token)
-}
-
+// disarm Function
 def disarm() {
-	def token = login(token)
-        def details = getSessionDetails(token) // Get Location & Device ID
-            // log.debug "This was Selected " + settings.selectedLocation
-        def locationName = settings.selectedLocation
-    	def deviceId = details.deviceMap[locationName]
-            // log.debug "DisArm Function. Device ID is " + deviceId
-    	def locationId = details.locationMap[locationName]
-            // log.debug "DisArm Function. Location ID is " + locationId
-
-        	def paramsDisarm = [
-    			uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/DisarmSecuritySystem",
-    			body: [SessionID: token, LocationID: locationId, DeviceID: deviceId, UserCode: '-1']
-    			]
-   			httpPost(paramsDisarm)  
-   	def metaData = panelMetaData(token, locationId) // Gets AlarmCode
-        	while( metaData.alarmCode != 10200 ){ 
-                pause(3000) // 3 Seconds Pause to relieve number of retried on while loop
-                metaData = panelMetaData(token, locationId)
-            }
-           // log.debug "Home is now Disarmed successfully"   
-           sendPush("Home is now Disarmed successfully")
-	logout(token)
-         
+	if(isTokenValid())
+    	disarmAuthenticated()
+    else {
+		login(disarmAuthenticated)
+    }
 }
+
+def disarmAuthenticated() {
+	tcCommandAsync("DisarmSecuritySystem", [SessionID: state.token, LocationID: settings.locationId, DeviceID: settings.deviceId, UserCode: '-1'], 0, "disarm")
+}
+
+// armStay Function
+def armStay() {
+	if(isTokenValid())
+    	armStayAuthenticated()
+    else {
+		login(armStayAuthenticated)
+    }
+}
+
+def armStayAuthenticated() {
+	tcCommandAsync("ArmSecuritySystem", [SessionID: state.token, LocationID: settings.locationId, DeviceID: settings.deviceId, ArmType: 1, UserCode: '-1'], 0, "armStay")
+}
+
+// armAway Function
+def armAway() {
+	if(isTokenValid())
+    	armAwayAuthenticated()
+    else {
+		login(armAwayAuthenticated)
+    }
+}
+
+def armAwayAuthenticated() {
+	tcCommandAsync("ArmSecuritySystem", [SessionID: state.token, LocationID: settings.locationId, DeviceID: settings.deviceId, ArmType: 0, UserCode: '-1'], 0 , "armAway")
+}
+
+// Login Function.
+def login(callback) {
+	//log.debug "Executed login"
+    tcCommandAsync("AuthenticateUserLogin",  [userName: settings.userName , password: settings.password, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion], 0, callback)
+}
+
+def loginResponse(token, callback) {
+  if(token != null) {
+    //log.debug "new token is ${token}"
+      state.token = "${token}"
+      state.tokenRefresh = now()
+  }
+    switch(callback) {
+      case "refresh":
+          refresh()
+          break
+        case "refreshAuthenticated":
+          refreshAuthenticated()
+          break
+        case "getSessionDetails":
+        	getSessionDetails()
+          break
+        case "armAway":
+        	armAway()
+        	break
+        case "armAwayAuthenticated":
+        	armAwayAuthenticated()
+        	break
+        case "armStay":
+        	armStay()
+        	break
+        case "armStayAuthenticated":
+        	armStayAuthenticated()
+        	break
+        case "getPanelMetadata":
+        	getPanelMetadata()
+        	break
+        case "disarm":
+        	disarm()
+        	break
+        default:
+            return
+        break
+    }
+}
+
+def logout() {
+    tcCommandAsync("Logout",  [SessionID: state.token], 0, "logout")
+} //Takes token as argument
+
+// Asyn APIs
+def tcCommandAsync(path, body, retry, callback) {
+  //log.debug "tcCommandAsync was Executed"
+	String stringBody = ""
+
+    body.each { k, v ->
+    	if(!(stringBody == "")) {
+        	stringBody += "&" }
+        stringBody += "${k}=${v}"
+    }//convert Map to String
+
+	//log.debug "stringBody: ${stringBody}"
+
+    def params = [
+		uri: "https://rs.alarmnet.com/TC21API/TC2.asmx/",
+		path: path,
+    	body: stringBody,
+        requestContentType: "application/x-www-form-urlencoded",
+        contentType: "application/xml"
+    ]
+
+    def handler
+
+    switch(path) {
+        case "GetPanelMetaDataAndFullStatusEx":
+        	handler = "panel"
+            break
+        case "GetZonesListInStateEx":
+        	handler = "zone"
+            break
+        case "AuthenticateUserLogin":
+        	handler = "login"
+            break
+        case "GetSessionDetails":
+        	handler = "details"
+            break
+        case "ArmSecuritySystem":
+          handler = "refresh"
+            break
+        case "DisarmSecuritySystem":
+        	handler = "refresh"
+            break
+        default:
+        	handler = "none"
+            break
+    }//define handler based on method called
+
+    def data = [
+    	path: path,
+        body: stringBody,
+        handler: handler,
+        callback: callback,
+        retry: retry
+    ] //Data for Async Command.  Params to retry, handler to handle, and retry count if needed
+
+    try {
+    	asynchttp_v1.post('asyncResponse', params, data)
+        //log.debug "Sent asynchhttp_v1.post(responseHandler, ${params}, ${data})"
+    } catch (e) {
+    	log.error "Something unexpected went wrong in tcCommandAsync: ${e}"
+	}//try / catch for asynchttpPost
+}//async post command
+
+def asyncResponse(response, data) {
+    //log.debug "asyncresponse was Executed"
+    if (response.hasError()) {
+        log.debug "error response data: ${response.errorData}"
+        try {
+            // exception thrown if xml cannot be parsed from response
+            log.debug "error response xml: ${response.errorXml}"
+        } catch (e) {
+            log.warn "error parsing xml: ${e}"
+        }
+        try {
+            // exception thrown if json cannot be parsed from response
+            log.debug "error response json: ${response.errorJson}"
+        } catch (e) {
+            log.warn "error parsing json: ${e}"
+        }
+    }
+
+    response = response.getXml()
+ 	//log.debug "data:  ${data}"
+  //log.debug "response received: ${response}"
+    try {
+    	def handler = data.get('handler')
+        def callback = data.get('callback')
+
+        if(handler == "login") {
+            if(response.ResultCode == "0") {
+            	loginResponse(response.SessionID, callback)
+            }
+            else {
+                log.error "Command Type: ${data} failed with ResultCode: ${resultCode} and ResultData: ${resultData}"
+            }
+        }
+        else {
+            //validate response
+            def resultCode = response.ResultCode
+            def resultData = response.ResultData
+
+            switch(resultCode) {
+                case "0": //Successful Command
+                case "4500": //Successful Command for Arm Action
+                    state.tokenRefresh = now() //we ran a successful command, that will keep the token alive
+
+                    //log.debug "Handler: ${data.get('handler')}"
+                    switch(handler) {
+                        case "details":
+                            //details handler would be executed only when you need LocationID & DeviceID, that is during initial Setup & Updates.
+                            def locationId
+                            def deviceId
+                            def locationName
+                            Map locationMap = [:]
+                            Map deviceMap = [:]
+                            response.Locations.LocationInfoBasic.each
+                            {
+                                LocationInfoBasic ->
+                                locationName = LocationInfoBasic.LocationName
+                                locationId = LocationInfoBasic.LocationID
+                                deviceId = LocationInfoBasic.DeviceList.DeviceInfoBasic.DeviceID
+                                locationMap["${locationName}"] = "${locationId}"
+                                deviceMap["${locationName}"] = "${deviceId}"
+                            }
+                            atomicState.locationMap = locationMap
+                            atomicState.deviceMap = deviceMap
+                            log.debug "During 'details' handler, LocationMap is $atomicState.locationMap & DeviceMap is $atomicState.deviceMap"
+                            break
+                        case "panel":
+                            updateAlarmStatus(getAlarmStatus(response))
+                            break
+                        case "refresh":
+                            refresh()
+                            break
+                        default:
+                            return
+                            break
+                    }//switch(data)
+                    break
+                case "-102":
+                    //this means the Session ID is invalid, needs to login and try again
+                    log.error "Command Type: ${data} failed with ResultCode: ${resultCode} and ResultData: ${resultData}"
+                    log.debug "Attempting to refresh token and try again for method ${callback}"
+                    state.token = null
+                    if(state.loginRetry == null || state.loginRetry == 0) {
+                      state.loginRetry = 1;
+                      state.token = null
+                      login(callback)
+                    }
+                    else {
+                      state.loginRetry = 0;
+                    }
+                    break
+                case "4101": //We are unable to connect to the security panel. Please try again later or contact support
+                case "4108": //Panel not connected with Virtual Keypad. Check Power/Communication failure
+                case "-4002": //The specified location is not valid
+                case "-4108": //Cannot establish a connection at this time. Please contact your Security Professional if the problem persists.
+                default: //Other Errors
+                    log.error "Command Type: ${data} failed with ResultCode: ${resultCode} and ResultData: ${resultData}"
+                    break
+            }//switch
+        }
+	} catch (SocketTimeoutException e) {
+        //identify a timeout and retry?
+		log.error "Timeout Error: $e"
+    } catch (e) {
+    	log.error "Something unexpected went wrong in asyncResponse: $e"
+	}//try / catch for httpPost
+}//asyncResponse
+
+// Other necessary functions.
+def isTokenValid() {
+	def isValid = true
+    if(state.token == null) {
+    	isValid = false
+    }
+    else {
+        Long timeSinceRefresh = now() - (state.tokenRefresh != null ? state.tokenRefresh : 0)
+
+        //return false if time since refresh is over 4 minutes (likely timeout)
+        if(timeSinceRefresh > 240000) {
+            state.token = null
+            isValid = false
+        }
+    }
+
+    return isValid
+} // This is a logical check only, assuming known timeout values and clearing token on loggout.  This method does no testing of the actua
+
+
+def getSessionDetails() {
+	tcCommandAsync("GetSessionDetails", [SessionID: state.token, ApplicationID: settings.applicationId, ApplicationVersion: settings.applicationVersion], 0, "getSessionDetails") //This updates panel status
+}
+
+def getLocations() {
+	login(getSessionDetails)
+}
+
+def getPanelMetadata() {
+	tcCommandAsync("GetPanelMetaDataAndFullStatusEx", [SessionID: state.token, LocationID: settings.locationId, LastSequenceNumber: 0, LastUpdatedTimestampTicks: 0, PartitionID: 1], 0, "getPanelMetadata") //This updates panel status
+}
+
+def refresh() {
+	if(isTokenValid()) {
+    	refreshAuthenticated()
+    }
+    else {
+    	login(refreshAuthenticated)
+    }
+}
+
+def refreshAuthenticated() {
+	getPanelMetadata() // Gets AlarmCode
+}
+
+def updateAlarmStatus(alarmCode) {
+    if(state.alarmCode != alarmCode) {
+        if (alarmCode == "10200") {
+            log.debug "Status is: Disarmed"
+            sendPush("Home is Disarmed successfully")
+            //sendEvent(name: "lock", value: "unlocked", displayed: "true", description: "Disarming")
+            //sendEvent(name: "switch", value: "off", displayed: "true", description: "Disarming")
+            //sendEvent(name: "status", value: "Disarmed", displayed: "true", description: "Refresh: Alarm is Disarmed")
+        } else if (alarmCode == "10203") {
+            log.debug "Status is: Armed Stay"
+            sendPush("Home is armed in Night mode successfully")
+            //sendEvent(name: "status", value: "Armed Stay", displayed: "true", description: "Refresh: Alarm is Armed Stay")
+            //sendEvent(name: "switch", value: "on", displayed: "true", description: "Arming Stay")
+        } else if (alarmCode =="10201") {
+            log.debug "Status is: Armed Away"
+            sendPush("Home is now Armed successfully")
+        }
+    }
+	//logout(token)
+    state.alarmCode = alarmCode
+}
+
+// Gets Panel Metadata.
+def getAlarmStatus(response) {
+	String alarmCode
+	alarmCode = response.PanelMetadataAndStatus.Partitions.PartitionInfo.ArmingState
+	state.alarmStatusRefresh = now()
+	return alarmCode
+} //returns alarmCode
